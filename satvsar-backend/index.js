@@ -78,7 +78,7 @@ app.use("/distributor", distributorRoutes);
 
 // Test route
 app.get("/", (req, res) => {
-  res.send("Updated Backend Running...");
+  res.send("BILLING SATVSAR");
 });
 
 // Error handling middleware
