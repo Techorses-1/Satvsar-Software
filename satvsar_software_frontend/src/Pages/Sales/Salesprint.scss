@@ -1,0 +1,465 @@
+#sales-pdf {
+  width: 210mm;
+  // min-height: 297mm;
+  margin: 0 auto;
+  font-family: Arial, sans-serif;
+  font-size: 12px;
+  color: #333;
+  background: #fff;
+  box-sizing: border-box;
+  position: relative;
+  page-break-after: avoid;
+  page-break-inside: avoid;
+
+  /* ADDED: Better spacing for content */
+  .invoice-container {
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+    position: relative;
+    padding: 10mm 10mm 15mm 10mm;
+    /* ← ADDED: Spacing inside container */
+  }
+
+  /* New Header Design */
+  .new-invoice-header {
+    text-align: center;
+    margin-bottom: 15px;
+    /* ← INCREASED: More space below header */
+    page-break-inside: avoid;
+
+    .tax-invoice-title {
+      h1 {
+        margin: 0 0 8px 0;
+        /* ← INCREASED: More space below title */
+        font-size: 24px;
+        font-weight: bold;
+        color: #000;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+      }
+
+      .title-line {
+        width: 90%;
+        /* ← REDUCED: Shorter line for better spacing */
+        height: 2px;
+        background: #000;
+        margin: 0 auto 15px auto;
+      }
+    }
+
+    .satvsar-logo {
+      margin: 5px auto;
+      /* ← INCREASED: More space around logo */
+
+      img {
+        max-width: 120px;
+        height: auto;
+        display: block;
+        margin: 0 auto;
+      }
+    }
+  }
+
+  /* FROM / BILL TO / SHIP TO Section - Updated with card style */
+  .addresses-section {
+    display: flex;
+    justify-content: space-between;
+    gap: 15px;
+    margin-bottom: 5px;
+    margin-top: -20px;
+    page-break-inside: avoid;
+
+    .from-address,
+    .bill-to-address,
+    .ship-to-address {
+      flex: 1;
+      /* CARD STYLE from second example */
+      padding: 10px;
+      /* ← Reduced from 15px to match card style */
+      border: 1px solid #ddd;
+      /* ← Changed from #333 to #ddd for card style */
+      border-radius: 5px;
+      /* ← ADDED: Rounded corners like card */
+      min-height: 150px;
+      display: flex;
+      flex-direction: column;
+      box-sizing: border-box;
+      /* ← ADDED: Better box model */
+
+      .section-title {
+        font-weight: bold;
+        font-size: 12px;
+        /* ← Changed from 14px to match */
+        margin-bottom: 10px;
+        /* ← Adjusted */
+        padding-bottom: 5px;
+        /* ← Adjusted */
+        border-bottom: 1px solid #eee;
+        /* ← Changed from #333 to #eee */
+        text-align: left;
+      }
+
+      .company-details,
+      .billing-details,
+      .shipping-details {
+        flex: 1;
+
+        p {
+          margin: 4px 0;
+          /* ← Adjusted from 5px to match */
+          font-size: 11px;
+          line-height: 1.4;
+          word-break: break-word;
+          /* ← ADDED: Better text wrapping */
+        }
+
+        strong {
+          font-weight: bold;
+        }
+      }
+    }
+  }
+
+  /* Invoice Number and Date */
+  .invoice-info-section {
+    margin-bottom: 0px;
+    /* ← INCREASED: More space below */
+    page-break-inside: avoid;
+
+    .invoice-number-info {
+      text-align: right;
+
+      p {
+        margin: 3px 0;
+        /* ← INCREASED: More space between lines */
+        font-size: 12px;
+
+        strong {
+          font-weight: bold;
+        }
+      }
+    }
+  }
+
+  /* Items Table */
+  .items-section {
+    margin-bottom: 5px;
+    margin-top: -10px;
+    page-break-inside: auto;
+
+    h3 {
+      margin: 0 0 12px 0;
+      /* ← INCREASED: More space below heading */
+      font-size: 14px;
+      color: #333;
+      border-bottom: 1px solid #ddd;
+      padding-bottom: 6px;
+      /* ← INCREASED: More padding below */
+      page-break-after: avoid;
+    }
+
+    .items-table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+
+      th,
+      td {
+        border: 1px solid #ddd;
+        padding: 8px 6px;
+        /* ← INCREASED: More vertical padding */
+        font-size: 11px;
+        word-wrap: break-word;
+        page-break-inside: avoid;
+      }
+
+      th {
+        background: #f5f5f5;
+        font-weight: bold;
+        text-align: center;
+      }
+
+      td {
+        text-align: right;
+
+        &:nth-child(2),
+        &:nth-child(3) {
+          text-align: left;
+        }
+      }
+
+      // Column widths with better spacing
+      th:nth-child(1),
+      td:nth-child(1) {
+        width: 7%;
+      }
+
+      th:nth-child(2),
+      td:nth-child(2) {
+        width: 33%;
+      }
+
+      th:nth-child(3),
+      td:nth-child(3) {
+        width: 12%;
+      }
+
+      th:nth-child(4),
+      td:nth-child(4) {
+        width: 8%;
+      }
+
+      th:nth-child(5),
+      td:nth-child(5) {
+        width: 12%;
+      }
+
+      th:nth-child(6),
+      td:nth-child(6) {
+        width: 10%;
+      }
+
+      th:nth-child(7),
+      td:nth-child(7) {
+        width: 18%;
+      }
+
+      tr {
+        page-break-inside: avoid;
+        page-break-after: auto;
+      }
+    }
+  }
+
+  /* Totals Section */
+  .totals-section {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 5px;
+    margin-bottom: -15px;
+    page-break-inside: avoid;
+
+    .amount-details {
+      width: 280px;
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+
+        td {
+          padding: 7px 6px;
+          /* ← INCREASED: More vertical padding */
+          text-align: right;
+
+          &:first-child {
+            text-align: left;
+            font-weight: bold;
+          }
+        }
+
+        .grand-total td {
+          font-size: 14px;
+          font-weight: bold;
+          border-top: 2px solid #333;
+          padding-top: 5px;
+          /* ← ADDED: More space above grand total */
+        }
+      }
+    }
+  }
+
+  /* Amount in Words */
+  .amount-in-words {
+    margin-bottom: 2px;
+    /* ← INCREASED: More space below */
+    padding: 8px;
+    /* ← INCREASED: More padding inside */
+    background: #f9f9f9;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    page-break-inside: avoid;
+
+    p {
+      margin: 0;
+      font-size: 11px;
+      font-style: italic;
+      line-height: 1.4;
+      /* ← INCREASED: Better line height */
+    }
+  }
+
+  /* Payment Method Section */
+  .payment-method-section {
+    margin-bottom: 5px;
+    margin-top: -10px;
+    padding: 8px;
+    /* ← INCREASED: More padding inside */
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    page-break-inside: avoid;
+
+    p {
+      margin: 0;
+      font-size: 12px;
+      line-height: 1.4;
+      /* ← INCREASED: Better line height */
+
+      strong {
+        font-weight: bold;
+      }
+    }
+  }
+
+  /* Declaration and Terms Section */
+  .declaration-terms-section {
+    margin-bottom: 5px;
+    /* ← INCREASED: More space below */
+    page-break-inside: avoid;
+
+    .terms-section {
+      h3 {
+        margin: 0 0 10px 0;
+        /* ← INCREASED: More space below heading */
+        font-size: 12px;
+        border-bottom: 1px solid #ddd;
+        padding-bottom: 5px;
+        /* ← INCREASED: More padding below */
+      }
+
+      p {
+        margin: 0 0 5px 0;
+        /* ← INCREASED: Space between paragraphs */
+        font-size: 10px;
+        word-wrap: break-word;
+        line-height: 1.4;
+        /* ← INCREASED: Better line height */
+      }
+    }
+  }
+
+  /* Footer */
+  .invoice-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    margin-top: 30px;
+    /* ← INCREASED: More space above footer */
+    padding-top: 20px;
+    /* ← INCREASED: More padding above */
+    border-top: 1px solid #ddd;
+    page-break-inside: avoid;
+
+    .thank-you {
+      flex: 1;
+      text-align: left;
+      padding-left: 10px;
+      /* ← ADDED: Left padding */
+
+      p {
+        font-weight: bold;
+        font-style: italic;
+        font-size: 11px;
+        margin: 0;
+      }
+    }
+
+    .signature {
+      flex: 1;
+      text-align: right;
+      padding-right: 10px;
+      /* ← ADDED: Right padding */
+
+      p {
+        margin: 0 0 8px 0;
+        /* ← INCREASED: More space below */
+        font-size: 11px;
+        text-align: center;
+      }
+
+      .signature-line {
+        width: 150px;
+        height: 1px;
+        background: #333;
+        margin: 0 auto;
+      }
+    }
+  }
+
+  /* Page Footer - Fixed for every page */
+  .page-footer {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 15mm;
+    text-align: center;
+    border-top: 1px solid #ddd;
+    padding-top: 8px;
+    /* ← INCREASED: More padding */
+    background: white;
+    z-index: 1000;
+
+    p {
+      margin: 0;
+      font-size: 10px;
+      font-weight: bold;
+      color: #666;
+      font-style: italic;
+    }
+  }
+}
+
+/* Print media query - CRITICAL FIXES */
+@media print {
+
+  body,
+  html {
+    width: 210mm;
+    margin: 0 auto !important;
+  }
+
+  #sales-pdf {
+    width: 210mm !important;
+    margin: 0 auto !important;
+    padding: 20mm 15mm !important;
+    /* ← ADDED: More padding for print */
+    box-shadow: none !important;
+    position: relative !important;
+
+    .invoice-container {
+      padding: 10mm 5mm !important;
+      /* ← ADDED: Adjusted inner spacing for print */
+    }
+
+    .page-footer {
+      position: fixed !important;
+      bottom: 0 !important;
+      left: 0 !important;
+      right: 0 !important;
+      height: 15mm !important;
+      background: white !important;
+      padding: 15mm 15mm 0 15mm !important;
+      /* ← ADDED: Match outer padding */
+    }
+
+    /* Ensure proper page breaks */
+    .items-table {
+      page-break-inside: auto !important;
+
+      tr {
+        page-break-inside: avoid !important;
+        page-break-after: auto !important;
+      }
+    }
+
+    .totals-section,
+    .amount-in-words,
+    .payment-method-section,
+    .declaration-terms-section,
+    .invoice-footer {
+      page-break-before: avoid !important;
+      page-break-inside: avoid !important;
+    }
+  }
+}
