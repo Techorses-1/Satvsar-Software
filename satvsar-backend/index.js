@@ -8,7 +8,30 @@ dotenv.config();
 
 const app = express();
 
-app.use(cors());
+// ====== CORS CONFIGURATION ======
+const allowedOrigins = [
+  'http://localhost:5173',
+  'https://satvsar.com',
+  'https://billing.satvsar.com'
+];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      console.log('Blocked by CORS:', origin);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+}));
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -40,11 +63,6 @@ const billingDashboardRoutes = require("./routes/billingDashboard");
 const reportsRoutes = require("./routes/reports");
 const distributorRoutes = require("./routes/distributorRoutes");
 
-
-
-
-
-
 // USE ROUTES
 app.use("/user", userRoutes);
 app.use("/admin", adminRoutes);
@@ -66,16 +84,6 @@ app.use("/dashboard", billingDashboardRoutes);
 app.use("/reports", reportsRoutes);
 app.use("/distributor", distributorRoutes);
 
-
-
-
-
-
-
-
-
-
-
 // Test route
 app.get("/", (req, res) => {
   res.send("BILLING SATVSAR");
@@ -87,7 +95,6 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Something went wrong!" });
 });
 
-// const PORT = process.env.PORT || 3052;
 const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => console.log(`🔥 Server running on port ${PORT}`));
