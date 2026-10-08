@@ -1,31 +1,33 @@
-// routes/orderRoutes.js - UNIFIED ORDER ROUTES (ALL ROUTE NAMES KEPT SAME)
+// routes/orderRoutes.js - UNIFIED ORDER ROUTES
 const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
 const Order = require("../modals/Orders");
-const GlobalCounter = require("../modals/globalCounter");
+const CancelledOrder = require("../modals/CancelledOrder");
 const Inventory = require("../modals/Inventory");
 const DeletedOrder = require("../modals/deletedOrderModel");
-const ProductOffer = require("../modals/ProductOffers"); // ✅ ADDED
+const ProductOffer = require("../modals/ProductOffers");
 const { auth } = require("../middleware/auth");
 const User = require("../modals/User");
-const Cart = require("../modals/Cart");  // Add this line with other imports
+const Cart = require("../modals/Cart");
 const ProductStockHistory = require("../modals/ProductStockHistory");
+const {
+    getNextInvoiceNumber,
+    releaseInvoiceNumber,
+} = require("../utils/invoiceNumber");
 
 // Check if offer is valid
 function isOfferValid(offer) {
     if (!offer || !offer.isActive) return false;
-
     const now = new Date();
     if (offer.startDate > now) return false;
     if (!offer.endDate) return true;
-
     return now >= offer.startDate && now <= offer.endDate;
 }
 
 // Calculate tax (5% INCLUDED in price)
 function calculateTaxIncluded(priceWithTax) {
-    const taxRate = 5; // 5%
+    const taxRate = 5;
     const taxAmount = (priceWithTax * taxRate) / (100 + taxRate);
     const baseValue = priceWithTax - taxAmount;
     const cgst = taxAmount / 2;
@@ -40,11 +42,158 @@ function calculateTaxIncluded(priceWithTax) {
     };
 }
 
+// ============================================================
+// HELPER — Restore inventory for a cancelled order
+// Restores both batch.quantity and batch.currentQuantity,
+// updates ProductStockHistory, and re-activates sold-out batches.
+// ============================================================
+async function restoreOrderStock(order, reason, source) {
+    for (const item of order.items) {
+        const inventory = await Inventory.findOne({ productId: item.productId });
+        if (!inventory) continue;
+
+        const batch = inventory.batches.find(
+            (b) => b.batchNumber === item.batchNumber
+        );
+        if (!batch) continue;
+
+        const beforeQuantity = batch.currentQuantity;
+
+        batch.quantity += item.quantity;
+        batch.currentQuantity += item.quantity;
+
+        if (batch.status === "sold-out" && batch.currentQuantity > 0) {
+            batch.status = "active";
+        }
+
+        const newQuantity = batch.currentQuantity;
+
+        // Update ProductStockHistory
+        let productStockDoc = await ProductStockHistory.findOne({
+            productId: item.productId,
+        });
+
+        if (!productStockDoc) {
+            productStockDoc = new ProductStockHistory({
+                productId: item.productId,
+                productName: item.productName,
+                inventoryId: inventory._id,
+                batches: [],
+            });
+        }
+
+        let batchEntry = productStockDoc.batches.find(
+            (b) => b.batchNumber === item.batchNumber
+        );
+        if (!batchEntry) {
+            batchEntry = {
+                batchId: require("uuid").v4(),
+                batchNumber: item.batchNumber,
+                currentStock: 0,
+                history: [],
+            };
+            productStockDoc.batches.push(batchEntry);
+            batchEntry =
+                productStockDoc.batches[productStockDoc.batches.length - 1];
+        }
+
+        batchEntry.currentStock = newQuantity;
+
+        batchEntry.history.push({
+            movementId: require("uuid").v4(),
+            type: "restored",
+            quantity: item.quantity,
+            previousStock: beforeQuantity,
+            newStock: newQuantity,
+            orderNumber: order.orderNumber,
+            orderType: order.orderType,
+            reason: `Order ${order.orderNumber} cancelled (${source})`,
+            notes: reason || `Cancelled via ${source}`,
+            addedBy: "system",
+            date: new Date(),
+        });
+
+        await productStockDoc.save();
+        await inventory.save();
+
+        console.log(
+            `   ↩ Restored ${item.quantity} units of ${item.productName} (Batch: ${item.batchNumber})`
+        );
+    }
+}
+
+// ============================================================
+// HELPER — Archive cancelled order
+//   - Copies order doc to CancelledOrder
+//   - Deletes from Order collection
+//   - Releases invoice number for reuse
+// ============================================================
+async function archiveCancelledOrder(order, req, reason, source) {
+    const cancelled = new CancelledOrder({
+        originalOrderId: order._id,
+        orderNumber: order.orderNumber,
+        date: order.date,
+        orderType: order.orderType,
+        businessType: order.businessType,
+        userId: order.userId,
+        customer: order.customer,
+        deliveryAddress: order.deliveryAddress,
+        shippingDetails: order.shippingDetails,
+        items: order.items.map((it) => it.toObject()),
+        checkoutMode: order.checkoutMode,
+        subtotal: order.subtotal,
+        baseValue: order.baseValue,
+        discount: order.discount,
+        promoDiscount: order.promoDiscount,
+        appliedPromoCode: order.appliedPromoCode,
+        loyaltyDiscount: order.loyaltyDiscount,
+        loyaltyCoinsUsed: order.loyaltyCoinsUsed,
+        totalSavings: order.totalSavings,
+        tax: order.tax,
+        cgst: order.cgst,
+        sgst: order.sgst,
+        taxPercentage: order.taxPercentage,
+        hasMixedTaxRates: order.hasMixedTaxRates,
+        taxPercentages: order.taxPercentages,
+        shipping: order.shipping,
+        total: order.total,
+        payment: order.payment,
+        timeline: {
+            ...order.timeline.toObject(),
+            cancelledAt: new Date(),
+        },
+        orderStatus: "cancelled",
+        loyaltyCoinsEarned: order.loyaltyCoinsEarned,
+        remarks: order.remarks,
+        notes: order.notes,
+        createdBy: order.createdBy,
+        updatedBy: order.updatedBy,
+
+        // Cancel metadata
+        cancelledBy: {
+            userId: req.user?.userId || req.user?._id || "",
+            name: req.user?.name || "",
+            email: req.user?.email || "",
+        },
+        cancelledAt: new Date(),
+        cancelReason: reason || "",
+        cancelSource: source,
+    });
+
+    await cancelled.save();
+
+    // Delete from active Order collection
+    await Order.findOneAndDelete({ orderNumber: order.orderNumber });
+
+    // Release the invoice number so it can be reused
+    await releaseInvoiceNumber(order.orderNumber);
+}
+
 // ======================================================================
 // SECTION 1: ONLINE/E-COMMERCE ROUTES
 // ======================================================================
 
-// 📦 CREATE ONLINE ORDER (UPDATED VERSION WITH EMAIL, CUSTOMER DETAILS & CART CLEARING)
+// 📦 CREATE ONLINE ORDER
 router.post('/create', auth, async (req, res) => {
     const startTime = Date.now();
     const requestId = `ONLINE_ORD_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -68,76 +217,43 @@ router.post('/create', auth, async (req, res) => {
             paymentMethod
         });
 
-        // 🛡️ VALIDATION
         if (!userId) {
-            return res.status(400).json({
-                success: false,
-                message: 'User ID required',
-                requestId
-            });
+            return res.status(400).json({ success: false, message: 'User ID required', requestId });
         }
-
         if (!items || !Array.isArray(items) || items.length === 0) {
-            return res.status(400).json({
-                success: false,
-                message: 'No items to order',
-                requestId
-            });
+            return res.status(400).json({ success: false, message: 'No items to order', requestId });
         }
-
         if (!address || !address.addressId) {
-            return res.status(400).json({
-                success: false,
-                message: 'Delivery address required',
-                requestId
-            });
+            return res.status(400).json({ success: false, message: 'Delivery address required', requestId });
         }
 
-        // 🛡️ STEP 1: FETCH USER DATA FROM USER MODEL
-        console.log(`👤 [${requestId}] Fetching user data for online order...`);
-
+        // STEP 1: FETCH USER DATA
+        console.log(`👤 [${requestId}] Fetching user data...`);
         let userData = null;
         try {
             const User = mongoose.model('User');
             userData = await User.findOne({ userId: userId });
-
             if (!userData) {
                 console.warn(`⚠️ [${requestId}] User not found in User model: ${userId}`);
-            } else {
-                console.log(`✅ [${requestId}] User data fetched:`, {
-                    userId: userData.userId,
-                    name: userData.name,
-                    email: userData.email,
-                    mobile: userData.mobile
-                });
             }
         } catch (userError) {
             console.error(`❌ [${requestId}] Error fetching user data:`, userError.message);
         }
 
-        // 🛡️ STEP 2: FETCH PRODUCT DETAILS AND EXTRA OFFERS FROM DATABASE
+        // STEP 2: FETCH PRODUCT DETAILS AND EXTRA OFFERS
         console.log(`🔍 [${requestId}] Fetching product details and extra offers...`);
-
         const Product = mongoose.model('Product');
         const validatedItems = [];
 
         for (const item of items) {
             const product = await Product.findOne({ productId: item.productId });
             if (!product) {
-                return res.status(400).json({
-                    success: false,
-                    message: `Product not found: ${item.productId}`,
-                    requestId
-                });
+                return res.status(400).json({ success: false, message: `Product not found: ${item.productId}`, requestId });
             }
 
             const selectedColor = product.colors?.find(c => c.colorId === item.selectedColor?.colorId) || product.colors?.[0];
             if (!selectedColor) {
-                return res.status(400).json({
-                    success: false,
-                    message: `Color not found for product: ${item.productId}`,
-                    requestId
-                });
+                return res.status(400).json({ success: false, message: `Color not found for product: ${item.productId}`, requestId });
             }
 
             const currentPrice = selectedColor.currentPrice;
@@ -204,20 +320,15 @@ router.post('/create', auth, async (req, res) => {
             });
         }
 
-        // 🛡️ STEP 3: VALIDATE INVENTORY FOR ALL ITEMS
+        // STEP 3: VALIDATE INVENTORY
         console.log(`🔍 [${requestId}] Validating inventory...`);
-
         const inventoryValidationResults = [];
 
         for (const validatedItem of validatedItems) {
             const inventoryItem = await Inventory.findOne({ productId: validatedItem.productId });
 
             if (!inventoryItem) {
-                return res.status(400).json({
-                    success: false,
-                    message: `Product not found in inventory: ${validatedItem.productName}`,
-                    requestId
-                });
+                return res.status(400).json({ success: false, message: `Product not found in inventory: ${validatedItem.productName}`, requestId });
             }
 
             let availableStock = 0;
@@ -234,23 +345,14 @@ router.post('/create', auth, async (req, res) => {
                 availableStock = activeBatches.reduce((sum, batch) => sum + batch.currentQuantity, 0);
 
                 if (availableStock < validatedItem.quantity) {
-                    return res.status(400).json({
-                        success: false,
-                        message: `Insufficient stock for ${validatedItem.productName}. Available: ${availableStock}, Requested: ${validatedItem.quantity}`,
-                        requestId
-                    });
+                    return res.status(400).json({ success: false, message: `Insufficient stock for ${validatedItem.productName}. Available: ${availableStock}, Requested: ${validatedItem.quantity}`, requestId });
                 }
 
                 batchToUse = activeBatches[0];
             } else {
                 availableStock = inventoryItem.stock;
-
                 if (availableStock < validatedItem.quantity) {
-                    return res.status(400).json({
-                        success: false,
-                        message: `Insufficient stock for ${validatedItem.productName}. Available: ${availableStock}, Requested: ${validatedItem.quantity}`,
-                        requestId
-                    });
+                    return res.status(400).json({ success: false, message: `Insufficient stock for ${validatedItem.productName}. Available: ${availableStock}, Requested: ${validatedItem.quantity}`, requestId });
                 }
             }
 
@@ -262,10 +364,10 @@ router.post('/create', auth, async (req, res) => {
             });
         }
 
-        // 🛡️ STEP 4: GENERATE ORDER NUMBER
-        const orderNumber = await Order.generateOrderNumber();
+        // STEP 4: GENERATE ORDER NUMBER (shared series)
+        const orderNumber = await getNextInvoiceNumber("ecom");
 
-        // 🛡️ STEP 5: CALCULATE ORDER TOTALS
+        // STEP 5: CALCULATE ORDER TOTALS
         let subtotal = 0;
         let totalDiscount = 0;
         let totalSavings = 0;
@@ -335,7 +437,7 @@ router.post('/create', auth, async (req, res) => {
         const shipping = 0;
         const total = totalFinalPrice;
 
-        // 🛡️ STEP 6: CREATE ORDER DOCUMENT
+        // STEP 6: CREATE ORDER
         const orderData = {
             orderNumber,
             date: new Date(),
@@ -404,18 +506,18 @@ router.post('/create', auth, async (req, res) => {
         const newOrder = new Order(orderData);
         await newOrder.save();
 
-        // 🗑️ CLEAR USER'S CART
+        // CLEAR USER'S CART
         if (checkoutMode === 'cart' && userId) {
             try {
                 const Cart = require("../modals/Cart");
                 const deletedCount = await Cart.deleteMany({ userId: userId });
-                console.log(`🗑️ [${requestId}] Cleared ${deletedCount.deletedCount} items from cart for user: ${userId}`);
+                console.log(`🗑️ [${requestId}] Cleared ${deletedCount.deletedCount} items from cart`);
             } catch (cartError) {
                 console.error(`⚠️ [${requestId}] Failed to clear cart:`, cartError.message);
             }
         }
 
-        // 📧 SEND ORDER CONFIRMATION EMAIL
+        // SEND ORDER CONFIRMATION EMAIL
         try {
             const user = await User.findOne({ userId: userId });
             if (user && user.email) {
@@ -445,7 +547,7 @@ router.post('/create', auth, async (req, res) => {
                 sendOrderEmail('orderConfirmation', user.email, emailData)
                     .then(result => {
                         if (result.success) {
-                            console.log(`📧 Order confirmation email sent to ${user.email} for order ${newOrder.orderNumber}`);
+                            console.log(`📧 Order confirmation email sent to ${user.email}`);
                         }
                     })
                     .catch(err => {
@@ -456,8 +558,7 @@ router.post('/create', auth, async (req, res) => {
             console.error(`❌ Error preparing order confirmation email:`, emailError.message);
         }
 
-        // 🛡️ STEP 8: UPDATE INVENTORY AND PRODUCT STOCK HISTORY
-        const ProductStockHistory = require("../modals/ProductStockHistory");
+        // STEP 8: UPDATE INVENTORY + PRODUCT STOCK HISTORY
         const inventoryUpdates = [];
 
         for (const item of inventoryValidationResults) {
@@ -476,10 +577,7 @@ router.post('/create', auth, async (req, res) => {
                 newStock = inventoryItem.stock;
             }
 
-            // ✅ UPDATE PRODUCT STOCK HISTORY (NEW WAY)
-            let productStockDoc = await ProductStockHistory.findOne({
-                productId: item.productId
-            });
+            let productStockDoc = await ProductStockHistory.findOne({ productId: item.productId });
 
             if (!productStockDoc) {
                 productStockDoc = new ProductStockHistory({
@@ -490,7 +588,6 @@ router.post('/create', auth, async (req, res) => {
                 });
             }
 
-            // Find or create batch entry
             let batchEntry = productStockDoc.batches.find(b => b.batchNumber === (item.batchToUse?.batchNumber || "SIMPLE"));
             if (!batchEntry) {
                 batchEntry = {
@@ -503,10 +600,7 @@ router.post('/create', auth, async (req, res) => {
                 batchEntry = productStockDoc.batches[productStockDoc.batches.length - 1];
             }
 
-            // Update current stock
             batchEntry.currentStock = newStock;
-
-            // Add movement to history
             batchEntry.history.push({
                 movementId: require('uuid').v4(),
                 type: "deducted",
@@ -522,24 +616,13 @@ router.post('/create', auth, async (req, res) => {
             });
 
             await productStockDoc.save();
-
-            // ✅ Keep inventory stockHistory ONLY for inventory operations (NO order entries!)
-            // We are NOT pushing to inventory.stockHistory anymore for orders
-
             inventoryUpdates.push(inventoryItem.save());
         }
 
         await Promise.all(inventoryUpdates);
 
         const processingTime = Date.now() - startTime;
-
-        console.log(`🎉 [${requestId}] ONLINE order created successfully!`, {
-            orderNumber,
-            itemsCount: newOrder.items.length,
-            totalAmount: newOrder.total,
-            totalDiscount: newOrder.totalDiscount,
-            processingTime: `${processingTime}ms`
-        });
+        console.log(`🎉 [${requestId}] ONLINE order created!`, { orderNumber, processingTime: `${processingTime}ms` });
 
         res.status(201).json({
             success: true,
@@ -594,23 +677,13 @@ router.post('/create', auth, async (req, res) => {
     }
 });
 
-
-
 // 📋 GET USER'S ONLINE ORDERS
 router.get('/user/:userId', auth, async (req, res) => {
     try {
         const { userId } = req.params;
-        const {
-            page = 1,
-            limit = 10,
-            status
-        } = req.query;
+        const { page = 1, limit = 10, status } = req.query;
 
-        const query = {
-            userId,
-            orderType: 'online'
-        };
-
+        const query = { userId, orderType: 'online' };
         if (status && status !== 'all') {
             query.orderStatus = status;
         }
@@ -624,7 +697,6 @@ router.get('/user/:userId', auth, async (req, res) => {
 
         const total = await Order.countDocuments(query);
 
-        // Calculate summary
         const summary = {
             totalOrders: total,
             pendingOrders: await Order.countDocuments({ userId, orderType: 'online', orderStatus: 'pending' }),
@@ -646,73 +718,45 @@ router.get('/user/:userId', auth, async (req, res) => {
 
     } catch (error) {
         console.error('Error fetching user orders:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to fetch orders'
-        });
+        res.status(500).json({ success: false, message: 'Failed to fetch orders' });
     }
 });
 
-// 🔍 GET SINGLE ORDER BY ORDER NUMBER (FOR ONLINE)
+// 🔍 GET SINGLE ORDER BY ORDER NUMBER
 router.get('/:orderNumber', auth, async (req, res) => {
     try {
         const { orderNumber } = req.params;
-
         const order = await Order.findOne({ orderNumber });
 
         if (!order) {
-            return res.status(404).json({
-                success: false,
-                message: 'Order not found'
-            });
+            return res.status(404).json({ success: false, message: 'Order not found' });
         }
 
-        res.json({
-            success: true,
-            order
-        });
+        res.json({ success: true, order });
 
     } catch (error) {
         console.error('Error fetching order:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to fetch order'
-        });
+        res.status(500).json({ success: false, message: 'Failed to fetch order' });
     }
 });
 
-// 📊 GET ORDER STATS SUMMARY (ONLINE USER)
+// 📊 GET ORDER STATS SUMMARY
 router.get('/stats/:userId', auth, async (req, res) => {
     try {
         const { userId } = req.params;
 
         const stats = await Order.aggregate([
-            {
-                $match: {
-                    userId,
-                    orderType: 'online'
-                }
-            },
+            { $match: { userId, orderType: 'online' } },
             {
                 $group: {
                     _id: null,
                     totalOrders: { $sum: 1 },
                     totalSpent: { $sum: "$total" },
-                    pendingOrders: {
-                        $sum: { $cond: [{ $eq: ["$orderStatus", "pending"] }, 1, 0] }
-                    },
-                    processingOrders: {
-                        $sum: { $cond: [{ $eq: ["$orderStatus", "processing"] }, 1, 0] }
-                    },
-                    shippedOrders: {
-                        $sum: { $cond: [{ $eq: ["$orderStatus", "shipped"] }, 1, 0] }
-                    },
-                    deliveredOrders: {
-                        $sum: { $cond: [{ $eq: ["$orderStatus", "delivered"] }, 1, 0] }
-                    },
-                    cancelledOrders: {
-                        $sum: { $cond: [{ $eq: ["$orderStatus", "cancelled"] }, 1, 0] }
-                    }
+                    pendingOrders: { $sum: { $cond: [{ $eq: ["$orderStatus", "pending"] }, 1, 0] } },
+                    processingOrders: { $sum: { $cond: [{ $eq: ["$orderStatus", "processing"] }, 1, 0] } },
+                    shippedOrders: { $sum: { $cond: [{ $eq: ["$orderStatus", "shipped"] }, 1, 0] } },
+                    deliveredOrders: { $sum: { $cond: [{ $eq: ["$orderStatus", "delivered"] }, 1, 0] } },
+                    cancelledOrders: { $sum: { $cond: [{ $eq: ["$orderStatus", "cancelled"] }, 1, 0] } }
                 }
             }
         ]);
@@ -727,7 +771,6 @@ router.get('/stats/:userId', auth, async (req, res) => {
             cancelledOrders: 0
         };
 
-        // Calculate monthly stats
         const currentMonth = new Date().getMonth();
         const currentYear = new Date().getFullYear();
 
@@ -769,59 +812,93 @@ router.get('/stats/:userId', auth, async (req, res) => {
 
     } catch (error) {
         console.error('Error fetching order stats:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to fetch order stats'
-        });
+        res.status(500).json({ success: false, message: 'Failed to fetch order stats' });
     }
 });
 
-// ✏️ UPDATE ORDER STATUS (user cancellation) - WITH PDF ATTACHMENT FOR SHIPPED/DELIVERED
+// ✏️ UPDATE ORDER STATUS
 router.put('/:orderNumber/status', auth, async (req, res) => {
     try {
         const { orderNumber } = req.params;
         const { status } = req.body;
 
-        // Validate status
         const validStatuses = ['pending', 'processing', 'shipped', 'delivered', 'cancelled'];
         if (!validStatuses.includes(status)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Invalid status'
-            });
+            return res.status(400).json({ success: false, message: 'Invalid status' });
         }
 
         const order = await Order.findOne({ orderNumber });
         if (!order) {
-            return res.status(404).json({
-                success: false,
-                message: 'Order not found'
+            return res.status(404).json({ success: false, message: 'Order not found' });
+        }
+
+        const oldStatus = order.orderStatus;
+
+        // ============================================================
+        // CANCEL FLOW — archive + restore stock + release number
+        // ============================================================
+        if (status === 'cancelled' && oldStatus !== 'cancelled') {
+            // Update timeline + status in memory first for archive
+            order.orderStatus = 'cancelled';
+            order.timeline.cancelledAt = new Date();
+
+            // Restore stock + ProductStockHistory
+            await restoreOrderStock(order, req.body.reason || 'Status set to cancelled', 'status-route');
+
+            // Archive to CancelledOrder + delete from Order + release invoice number
+            await archiveCancelledOrder(order, req, req.body.reason || '', 'status-route');
+
+            // Send email notification (optional)
+            if (order.orderType === 'online') {
+                try {
+                    let userEmail = null;
+                    let customerName = '';
+                    if (order.userId) {
+                        const user = await User.findOne({ userId: order.userId });
+                        if (user && user.email) {
+                            userEmail = user.email;
+                            customerName = user.name || order.deliveryAddress?.fullName || 'Customer';
+                        }
+                    }
+                    if (!userEmail && order.deliveryAddress?.email) {
+                        userEmail = order.deliveryAddress.email;
+                        customerName = order.deliveryAddress.fullName || 'Customer';
+                    }
+
+                    if (userEmail) {
+                        const { sendOrderEmail } = require('../config/userEmail');
+                        await sendOrderEmail('orderStatusUpdate', userEmail, {
+                            orderNumber: order.orderNumber,
+                            customerName,
+                            orderDate: order.date || order.createdAt,
+                            newStatus: 'cancelled',
+                            oldStatus,
+                            statusMessage: 'Your order has been cancelled.',
+                            total: order.total,
+                            timelineSteps: [],
+                            trackingNumber: null
+                        });
+                        console.log(`📧 Cancellation email sent to ${userEmail}`);
+                    }
+                } catch (emailError) {
+                    console.error(`❌ Email error on cancel:`, emailError.message);
+                }
+            }
+
+            return res.json({
+                success: true,
+                message: 'Order cancelled and archived',
+                order: order.getSummary()
             });
         }
 
-        // Store old status for comparison
-        const oldStatus = order.orderStatus;
-
-        // Update status
+        // ============================================================
+        // NON-CANCEL STATUS CHANGES — normal flow
+        // ============================================================
         order.orderStatus = status;
-
-        // Update timeline
         const now = new Date();
-        if (status === 'cancelled') {
-            order.timeline.cancelledAt = now;
 
-            // Restore stock if cancelled
-            for (const item of order.items) {
-                const inventory = await Inventory.findOne({ productId: item.productId });
-                if (inventory) {
-                    const batch = inventory.batches.find(b => b.batchNumber === item.batchNumber);
-                    if (batch) {
-                        batch.quantity += item.quantity;
-                        await inventory.save();
-                    }
-                }
-            }
-        } else if (status === 'delivered') {
+        if (status === 'delivered') {
             order.timeline.deliveredAt = now;
             order.payment.status = 'paid';
             order.payment.paymentDate = now;
@@ -834,11 +911,9 @@ router.put('/:orderNumber/status', auth, async (req, res) => {
 
         await order.save();
 
-        // ==================== 📧 SEND STATUS UPDATE EMAIL WITH PDF ATTACHMENT ====================
-        // Only send email if status actually changed and order is online
+        // Send status update email for online orders (existing flow)
         if (oldStatus !== status && order.orderType === 'online') {
             try {
-                // Get user email
                 let userEmail = null;
                 let customerName = '';
 
@@ -850,50 +925,40 @@ router.put('/:orderNumber/status', auth, async (req, res) => {
                     }
                 }
 
-                // If no user found, use delivery address email
                 if (!userEmail && order.deliveryAddress?.email) {
                     userEmail = order.deliveryAddress.email;
                     customerName = order.deliveryAddress.fullName || 'Customer';
                 }
 
                 if (userEmail) {
-                    // Prepare timeline steps for email
                     const timelineSteps = [
                         { title: 'Order Placed', status: 'completed', date: order.timeline.placedAt },
                         {
-                            title: 'Processing', status: order.orderStatus === 'processing' || ['shipped', 'delivered'].includes(order.orderStatus) ? 'completed' :
-                                order.orderStatus === 'cancelled' ? 'skipped' : 'pending',
+                            title: 'Processing', status: order.orderStatus === 'processing' || ['shipped', 'delivered'].includes(order.orderStatus) ? 'completed' : 'pending',
                             date: order.timeline.processingAt
                         },
                         {
-                            title: 'Shipped', status: order.orderStatus === 'shipped' || order.orderStatus === 'delivered' ? 'completed' :
-                                order.orderStatus === 'cancelled' ? 'skipped' : 'pending',
+                            title: 'Shipped', status: order.orderStatus === 'shipped' || order.orderStatus === 'delivered' ? 'completed' : 'pending',
                             date: order.timeline.shippedAt
                         },
                         {
-                            title: 'Delivered', status: order.orderStatus === 'delivered' ? 'completed' :
-                                order.orderStatus === 'cancelled' ? 'skipped' : 'pending',
+                            title: 'Delivered', status: order.orderStatus === 'delivered' ? 'completed' : 'pending',
                             date: order.timeline.deliveredAt
                         }
                     ];
 
-                    // Mark current status
-                    if (order.orderStatus !== 'cancelled') {
-                        const currentStepIndex = timelineSteps.findIndex(step =>
-                            step.title.toLowerCase() === order.orderStatus
-                        );
-                        if (currentStepIndex >= 0) {
-                            timelineSteps[currentStepIndex].status = 'current';
-                        }
+                    const currentStepIndex = timelineSteps.findIndex(step =>
+                        step.title.toLowerCase() === order.orderStatus
+                    );
+                    if (currentStepIndex >= 0) {
+                        timelineSteps[currentStepIndex].status = 'current';
                     }
 
-                    // Status messages
                     const statusMessages = {
                         'pending': 'Your order has been received and is awaiting confirmation.',
                         'processing': 'Your order is being prepared for shipment.',
                         'shipped': 'Your order has been shipped and is on its way to you!',
                         'delivered': 'Your order has been delivered. We hope you enjoy your purchase!',
-                        'cancelled': 'Your order has been cancelled as requested.'
                     };
 
                     const emailData = {
@@ -908,7 +973,6 @@ router.put('/:orderNumber/status', auth, async (req, res) => {
                         trackingNumber: order.trackingNumber || null
                     };
 
-                    // ✅✅✅ GENERATE PDF FOR SHIPPED AND DELIVERED STATUS
                     let pdfBuffer = null;
                     if (status === 'shipped' || status === 'delivered') {
                         try {
@@ -916,22 +980,17 @@ router.put('/:orderNumber/status', auth, async (req, res) => {
                             pdfBuffer = await generateInvoicePDF(order);
                             console.log(`📄 PDF generated for order ${order.orderNumber} (${status})`);
                         } catch (pdfError) {
-                            console.error(`❌ Failed to generate PDF for order ${order.orderNumber}:`, pdfError.message);
-                            // Continue without PDF - don't fail the email
+                            console.error(`❌ Failed to generate PDF:`, pdfError.message);
                         }
                     }
 
-                    // Send email with PDF attachment if available
                     const { sendOrderEmailWithAttachment } = require('../config/userEmail');
                     await sendOrderEmailWithAttachment('orderStatusUpdate', userEmail, emailData, pdfBuffer);
 
-                    console.log(`📧 Status update email sent to ${userEmail} for order ${order.orderNumber} (${oldStatus} → ${status})${pdfBuffer ? ' with PDF attachment' : ''}`);
-                } else {
-                    console.log(`ℹ️ No email found for order ${order.orderNumber}, skipping status update email`);
+                    console.log(`📧 Status update email sent to ${userEmail} (${oldStatus} → ${status})`);
                 }
             } catch (emailError) {
                 console.error(`❌ Error preparing status update email:`, emailError.message);
-                // Don't fail the status update if email fails
             }
         }
 
@@ -943,14 +1002,11 @@ router.put('/:orderNumber/status', auth, async (req, res) => {
 
     } catch (error) {
         console.error('Error updating order status:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to update order status'
-        });
+        res.status(500).json({ success: false, message: 'Failed to update order status' });
     }
 });
 
-// ❌ CANCEL ORDER (user request)
+// ❌ CANCEL ORDER
 router.put('/:orderNumber/cancel', auth, async (req, res) => {
     try {
         const { orderNumber } = req.params;
@@ -960,10 +1016,7 @@ router.put('/:orderNumber/cancel', auth, async (req, res) => {
 
         const order = await Order.findOne({ orderNumber });
         if (!order) {
-            return res.status(404).json({
-                success: false,
-                message: 'Order not found'
-            });
+            return res.status(404).json({ success: false, message: 'Order not found' });
         }
 
         if (!['pending', 'processing'].includes(order.orderStatus)) {
@@ -977,82 +1030,13 @@ router.put('/:orderNumber/cancel', auth, async (req, res) => {
         order.timeline.cancelledAt = new Date();
         order.notes = reason ? `Cancelled by user: ${reason}` : 'Cancelled by user';
 
-        // ========== RESTORE STOCK AND UPDATE PRODUCT STOCK HISTORY ==========
-        const ProductStockHistory = require("../modals/ProductStockHistory");
+        // Restore stock + ProductStockHistory
+        await restoreOrderStock(order, reason, 'cancel-route');
 
-        for (const item of order.items) {
-            const inventory = await Inventory.findOne({ productId: item.productId });
+        // Archive + delete + release number
+        await archiveCancelledOrder(order, req, reason || '', 'cancel-route');
 
-            if (inventory) {
-                const batch = inventory.batches.find(b => b.batchNumber === item.batchNumber);
-
-                if (batch) {
-                    const beforeQuantity = batch.currentQuantity;
-
-                    batch.quantity += item.quantity;
-                    batch.currentQuantity += item.quantity;
-
-                    if (batch.status === "sold-out" && batch.currentQuantity > 0) {
-                        batch.status = "active";
-                    }
-
-                    const newQuantity = batch.currentQuantity;
-
-                    // ✅ UPDATE PRODUCT STOCK HISTORY (RESTORE ENTRY)
-                    let productStockDoc = await ProductStockHistory.findOne({
-                        productId: item.productId
-                    });
-
-                    if (!productStockDoc) {
-                        productStockDoc = new ProductStockHistory({
-                            productId: item.productId,
-                            productName: item.productName,
-                            inventoryId: inventory._id,
-                            batches: []
-                        });
-                    }
-
-                    let batchEntry = productStockDoc.batches.find(b => b.batchNumber === item.batchNumber);
-                    if (!batchEntry) {
-                        batchEntry = {
-                            batchId: require('uuid').v4(),
-                            batchNumber: item.batchNumber,
-                            currentStock: 0,
-                            history: []
-                        };
-                        productStockDoc.batches.push(batchEntry);
-                        batchEntry = productStockDoc.batches[productStockDoc.batches.length - 1];
-                    }
-
-                    batchEntry.currentStock = newQuantity;
-
-                    batchEntry.history.push({
-                        movementId: require('uuid').v4(),
-                        type: "restored",
-                        quantity: item.quantity,
-                        previousStock: beforeQuantity,
-                        newStock: newQuantity,
-                        orderNumber: orderNumber,
-                        orderType: order.orderType,
-                        reason: `Order ${orderNumber} cancelled by user`,
-                        notes: reason || "User requested cancellation",
-                        addedBy: "system",
-                        date: new Date()
-                    });
-
-                    await productStockDoc.save();
-
-                    // ❌ NO LONGER pushing to inventory.stockHistory for cancellations
-                    await inventory.save();
-
-                    console.log(`✅ [CANCEL] Restored ${item.quantity} units of ${item.productName} (Batch: ${item.batchNumber})`);
-                }
-            }
-        }
-
-        await order.save();
-
-        console.log(`✅ [CANCEL] Order ${orderNumber} cancelled successfully with stock restored`);
+        console.log(`✅ [CANCEL] Order ${orderNumber} cancelled, archived, number released`);
 
         res.json({
             success: true,
@@ -1062,42 +1046,30 @@ router.put('/:orderNumber/cancel', auth, async (req, res) => {
 
     } catch (error) {
         console.error('Error cancelling order:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to cancel order'
-        });
+        res.status(500).json({ success: false, message: 'Failed to cancel order' });
     }
 });
 
-// 🎯 GET RECENT ORDERS (for dashboard)
+// 🎯 GET RECENT ORDERS
 router.get('/recent/:userId', auth, async (req, res) => {
     try {
         const { userId } = req.params;
         const { limit = 5 } = req.query;
 
-        const recentOrders = await Order.find({
-            userId,
-            orderType: 'online'
-        })
+        const recentOrders = await Order.find({ userId, orderType: 'online' })
             .sort({ createdAt: -1 })
             .limit(parseInt(limit))
             .select('orderNumber createdAt total orderStatus items');
 
-        res.json({
-            success: true,
-            orders: recentOrders
-        });
+        res.json({ success: true, orders: recentOrders });
 
     } catch (error) {
         console.error('Error fetching recent orders:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to fetch recent orders'
-        });
+        res.status(500).json({ success: false, message: 'Failed to fetch recent orders' });
     }
 });
 
-// 👑 ADMIN: GET ALL ORDERS (with filters and pagination)
+// 👑 ADMIN: GET ALL ORDERS
 router.get('/all/orders', async (req, res) => {
     try {
         const {
@@ -1112,39 +1084,21 @@ router.get('/all/orders', async (req, res) => {
             sortOrder = 'desc'
         } = req.query;
 
-        // Build query
         const query = {};
 
-        // Filter by order type
-        if (orderType && orderType !== 'all') {
-            query.orderType = orderType;
-        }
+        if (orderType && orderType !== 'all') query.orderType = orderType;
+        if (status && status !== 'all') query.orderStatus = status;
+        if (userId) query.userId = userId;
 
-        // Filter by status
-        if (status && status !== 'all') {
-            query.orderStatus = status;
-        }
-
-        // Filter by user ID
-        if (userId) {
-            query.userId = userId;
-        }
-
-        // Filter by date range
         if (startDate || endDate) {
             query.createdAt = {};
-            if (startDate) {
-                query.createdAt.$gte = new Date(startDate);
-            }
-            if (endDate) {
-                query.createdAt.$lte = new Date(endDate);
-            }
+            if (startDate) query.createdAt.$gte = new Date(startDate);
+            if (endDate) query.createdAt.$lte = new Date(endDate);
         }
 
         const skip = (parseInt(page) - 1) * parseInt(limit);
         const sort = { [sortBy]: sortOrder === 'desc' ? -1 : 1 };
 
-        // Get orders with pagination
         const orders = await Order.find(query)
             .sort(sort)
             .skip(skip)
@@ -1153,7 +1107,6 @@ router.get('/all/orders', async (req, res) => {
 
         const total = await Order.countDocuments(query);
 
-        // ✅ UPDATED STATS - EXCLUDING CANCELLED ORDERS FROM REVENUE
         const stats = await Order.aggregate([
             { $match: query },
             {
@@ -1161,13 +1114,7 @@ router.get('/all/orders', async (req, res) => {
                     _id: null,
                     totalOrders: { $sum: 1 },
                     totalRevenue: {
-                        $sum: {
-                            $cond: [
-                                { $eq: ["$orderStatus", "cancelled"] },
-                                0,  // ❌ CANCELLED ORDERS = ₹0 for revenue
-                                "$total"
-                            ]
-                        }
+                        $sum: { $cond: [{ $eq: ["$orderStatus", "cancelled"] }, 0, "$total"] }
                     },
                     totalItems: { $sum: { $size: "$items" } },
                     totalQuantity: {
@@ -1181,18 +1128,13 @@ router.get('/all/orders', async (req, res) => {
                     },
                     avgOrderValue: {
                         $avg: {
-                            $cond: [
-                                { $eq: ["$orderStatus", "cancelled"] },
-                                null,  // ❌ EXCLUDE cancelled from average
-                                "$total"
-                            ]
+                            $cond: [{ $eq: ["$orderStatus", "cancelled"] }, null, "$total"]
                         }
                     }
                 }
             }
         ]);
 
-        // Get status breakdown (still includes cancelled for counting)
         const statusBreakdown = await Order.aggregate([
             { $match: query },
             {
@@ -1200,20 +1142,13 @@ router.get('/all/orders', async (req, res) => {
                     _id: "$orderStatus",
                     count: { $sum: 1 },
                     totalAmount: {
-                        $sum: {
-                            $cond: [
-                                { $eq: ["$orderStatus", "cancelled"] },
-                                0,  // ❌ CANCELLED = ₹0 in status amounts
-                                "$total"
-                            ]
-                        }
+                        $sum: { $cond: [{ $eq: ["$orderStatus", "cancelled"] }, 0, "$total"] }
                     }
                 }
             },
             { $sort: { count: -1 } }
         ]);
 
-        // Get top products
         const topProducts = await Order.aggregate([
             { $match: query },
             { $unwind: "$items" },
@@ -1228,7 +1163,7 @@ router.get('/all/orders', async (req, res) => {
                         $sum: {
                             $cond: [
                                 { $eq: ["$orderStatus", "cancelled"] },
-                                0,  // ❌ CANCELLED products don't count in revenue
+                                0,
                                 "$items.totalAmount"
                             ]
                         }
@@ -1259,123 +1194,74 @@ router.get('/all/orders', async (req, res) => {
                 limit: parseInt(limit),
                 pages: Math.ceil(total / parseInt(limit))
             },
-            filters: {
-                orderType,
-                status,
-                userId,
-                startDate,
-                endDate,
-                sortBy,
-                sortOrder
-            }
+            filters: { orderType, status, userId, startDate, endDate, sortBy, sortOrder }
         });
 
     } catch (error) {
         console.error('Error fetching all orders:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to fetch orders'
-        });
+        res.status(500).json({ success: false, message: 'Failed to fetch orders' });
     }
 });
 
 // ======================================================================
-// SECTION 2: OFFLINE/BILLING ROUTES (EXACT SAME NAMES AS BEFORE)
+// SECTION 2: OFFLINE/BILLING ROUTES
 // ======================================================================
 
-// 🧾 CREATE OFFLINE ORDER (from billing software)
+// 🧾 CREATE OFFLINE ORDER
 router.post("/create-invoice", async (req, res) => {
     const startTime = Date.now();
     const requestId = `OFFLINE_ORD_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
     try {
-        console.log(`🏪 [${requestId}] Starting OFFLINE order creation (invoice)`);
+        console.log(`🏪 [${requestId}] Starting OFFLINE order creation`);
 
         if (!req.body.items || req.body.items.length === 0) {
-            return res.status(400).json({
-                success: false,
-                message: "Order must contain at least one item",
-                requestId: requestId
-            });
+            return res.status(400).json({ success: false, message: "Order must contain at least one item", requestId });
         }
 
         if (!req.body.customer || !req.body.customer.mobile || !req.body.customer.name) {
-            return res.status(400).json({
-                success: false,
-                message: "Customer name and mobile are required",
-                requestId: requestId
-            });
+            return res.status(400).json({ success: false, message: "Customer name and mobile are required", requestId });
         }
 
         let invoiceDate;
         if (req.body.date) {
             invoiceDate = new Date(req.body.date);
-            if (isNaN(invoiceDate.getTime())) {
-                invoiceDate = new Date();
-            }
+            if (isNaN(invoiceDate.getTime())) invoiceDate = new Date();
         } else {
             invoiceDate = new Date();
         }
 
-        // 🛡️ STEP 2: Validate ALL inventory items
+        // Validate inventory
         const inventoryValidation = [];
 
         for (const [index, item] of req.body.items.entries()) {
             if (!item.productId || !item.batchNumber || !item.quantity || item.quantity < 1) {
-                inventoryValidation.push({
-                    productId: item.productId,
-                    productName: item.name,
-                    error: "Invalid item data"
-                });
+                inventoryValidation.push({ productId: item.productId, productName: item.name, error: "Invalid item data" });
                 continue;
             }
 
             const inventoryItem = await Inventory.findOne({ productId: item.productId });
 
             if (!inventoryItem) {
-                inventoryValidation.push({
-                    productId: item.productId,
-                    productName: item.name,
-                    batchNumber: item.batchNumber,
-                    error: "Product not found in inventory"
-                });
+                inventoryValidation.push({ productId: item.productId, productName: item.name, batchNumber: item.batchNumber, error: "Product not found in inventory" });
                 continue;
             }
 
             const batch = inventoryItem.batches.find(b => b.batchNumber === item.batchNumber);
 
             if (!batch) {
-                inventoryValidation.push({
-                    productId: item.productId,
-                    productName: item.name,
-                    batchNumber: item.batchNumber,
-                    error: "Batch not found",
-                    availableBatches: inventoryItem.batches.map(b => b.batchNumber)
-                });
+                inventoryValidation.push({ productId: item.productId, productName: item.name, batchNumber: item.batchNumber, error: "Batch not found", availableBatches: inventoryItem.batches.map(b => b.batchNumber) });
                 continue;
             }
 
             const isExpired = new Date(batch.expiryDate) < new Date();
             if (isExpired) {
-                inventoryValidation.push({
-                    productId: item.productId,
-                    productName: item.name,
-                    batchNumber: item.batchNumber,
-                    error: "Batch has expired",
-                    expiryDate: batch.expiryDate
-                });
+                inventoryValidation.push({ productId: item.productId, productName: item.name, batchNumber: item.batchNumber, error: "Batch has expired", expiryDate: batch.expiryDate });
                 continue;
             }
 
             if (batch.currentQuantity < item.quantity) {
-                inventoryValidation.push({
-                    productId: item.productId,
-                    productName: item.name,
-                    batchNumber: item.batchNumber,
-                    error: "Insufficient quantity",
-                    available: batch.currentQuantity,
-                    requested: item.quantity
-                });
+                inventoryValidation.push({ productId: item.productId, productName: item.name, batchNumber: item.batchNumber, error: "Insufficient quantity", available: batch.currentQuantity, requested: item.quantity });
                 continue;
             }
 
@@ -1395,15 +1281,15 @@ router.post("/create-invoice", async (req, res) => {
             return res.status(400).json({
                 success: false,
                 message: "Inventory validation failed",
-                requestId: requestId,
+                requestId,
                 validationErrors: failedValidations
             });
         }
 
-        // 🛡️ STEP 3: Generate order number
-        const orderNumber = await Order.generateOrderNumber();
+        // Generate order number (shared series)
+        const orderNumber = await getNextInvoiceNumber("ecom");
 
-        // 🛡️ STEP 4: Prepare order data
+        // Prepare order data
         const orderItems = [];
 
         for (const validation of inventoryValidation) {
@@ -1451,7 +1337,6 @@ router.post("/create-invoice", async (req, res) => {
             }
         }
 
-        // Calculate totals
         const subtotal = orderItems.reduce((sum, item) => sum + (item.price * item.quantity), 0);
         const discount = orderItems.reduce((sum, item) => sum + item.discountAmount, 0);
         const baseValue = orderItems.reduce((sum, item) => sum + item.baseValue, 0);
@@ -1472,7 +1357,6 @@ router.post("/create-invoice", async (req, res) => {
             finalTotal -= loyaltyDiscount;
         }
 
-        // Create order document
         const orderData = {
             orderNumber,
             date: invoiceDate,
@@ -1508,10 +1392,7 @@ router.post("/create-invoice", async (req, res) => {
             baseValue: parseFloat(baseValue.toFixed(2)),
             discount: parseFloat(discount.toFixed(2)),
             promoDiscount: parseFloat(promoDiscount.toFixed(2)),
-            appliedPromoCode: req.body.appliedPromoCode ? {
-                ...req.body.appliedPromoCode,
-                appliedAt: new Date()
-            } : null,
+            appliedPromoCode: req.body.appliedPromoCode ? { ...req.body.appliedPromoCode, appliedAt: new Date() } : null,
             loyaltyDiscount: parseFloat(loyaltyDiscount.toFixed(2)),
             loyaltyCoinsUsed: req.body.loyaltyCoinsUsed || 0,
             tax: parseFloat(tax.toFixed(2)),
@@ -1542,16 +1423,12 @@ router.post("/create-invoice", async (req, res) => {
         const newOrder = new Order(orderData);
         await newOrder.save();
 
-        // 🛡️ UPDATE INVENTORY AND PRODUCT STOCK HISTORY
-        const ProductStockHistory = require("../modals/ProductStockHistory");
+        // Update inventory + ProductStockHistory
         const inventoryUpdates = [];
 
         for (const validation of inventoryValidation) {
             if (validation.valid) {
-                const batch = validation.inventoryItem.batches.find(
-                    b => b.batchNumber === validation.batchNumber
-                );
-
+                const batch = validation.inventoryItem.batches.find(b => b.batchNumber === validation.batchNumber);
                 if (!batch) continue;
 
                 const oldQuantity = batch.currentQuantity;
@@ -1564,11 +1441,7 @@ router.post("/create-invoice", async (req, res) => {
 
                 const newQuantity = batch.currentQuantity;
 
-                // ✅ UPDATE PRODUCT STOCK HISTORY (NEW WAY)
-                let productStockDoc = await ProductStockHistory.findOne({
-                    productId: validation.productId
-                });
-
+                let productStockDoc = await ProductStockHistory.findOne({ productId: validation.productId });
                 if (!productStockDoc) {
                     productStockDoc = new ProductStockHistory({
                         productId: validation.productId,
@@ -1591,7 +1464,6 @@ router.post("/create-invoice", async (req, res) => {
                 }
 
                 batchEntry.currentStock = newQuantity;
-
                 batchEntry.history.push({
                     movementId: require('uuid').v4(),
                     type: "sold",
@@ -1607,8 +1479,6 @@ router.post("/create-invoice", async (req, res) => {
                 });
 
                 await productStockDoc.save();
-
-                // ❌ NO LONGER pushing to inventory.stockHistory for order sales
                 inventoryUpdates.push(validation.inventoryItem.save());
             }
         }
@@ -1638,90 +1508,31 @@ router.post("/create-invoice", async (req, res) => {
     }
 });
 
-// 📋 GET ALL ORDERS - DEBUG VERSION
+// 📋 GET ALL ORDERS
 router.get("/all/get-invoices", async (req, res) => {
-    console.log("========== 🚀 GET INVOICES REQUEST RECEIVED ==========");
-    console.log("📅 Time:", new Date().toISOString());
-    console.log("🌐 Request URL:", req.originalUrl);
-    console.log("🔍 Query Parameters:", req.query);
-    console.log("👤 IP Address:", req.ip);
-    console.log("📋 Request Headers:");
-    console.log(JSON.stringify(req.headers, null, 2));
-    console.log("======================================================");
-
     try {
-        // Test if database connection works
-        console.log("🔌 Testing database connection...");
         const testConnection = await Order.findOne();
-        console.log("✅ Database connection successful");
 
-        const {
-            page = 1,
-            limit = 50,
-            orderType,
-            status,
-            startDate,
-            endDate
-        } = req.query;
-
-        console.log("🔧 Building query with params:", {
-            page, limit, orderType, status, startDate, endDate
-        });
-
+        const { page = 1, limit = 50, orderType, status, startDate, endDate } = req.query;
         const query = {};
 
-        // Filter by order type
-        if (orderType && orderType !== 'all') {
-            query.orderType = orderType;
-        }
+        if (orderType && orderType !== 'all') query.orderType = orderType;
+        if (status && status !== 'all') query.orderStatus = status;
 
-        // Filter by status
-        if (status && status !== 'all') {
-            query.orderStatus = status;
-        }
-
-        // Filter by date range
         if (startDate || endDate) {
             query.createdAt = {};
-            if (startDate) {
-                query.createdAt.$gte = new Date(startDate);
-            }
-            if (endDate) {
-                query.createdAt.$lte = new Date(endDate);
-            }
+            if (startDate) query.createdAt.$gte = new Date(startDate);
+            if (endDate) query.createdAt.$lte = new Date(endDate);
         }
-
-        console.log("🔍 Final MongoDB query:", JSON.stringify(query, null, 2));
 
         const skip = (parseInt(page) - 1) * parseInt(limit);
 
-        // Get orders
-        console.log("📦 Fetching orders from database...");
         const orders = await Order.find(query)
             .sort({ createdAt: -1 })
             .skip(skip)
             .limit(parseInt(limit));
 
         const total = await Order.countDocuments(query);
-
-        console.log("✅ Database query successful:");
-        console.log(`   Total orders: ${total}`);
-        console.log(`   Returning: ${orders.length} orders`);
-        console.log(`   First order number: ${orders[0]?.orderNumber}`);
-        console.log(`   First order date: ${orders[0]?.date}`);
-
-        // Log sample order structure
-        if (orders.length > 0) {
-            console.log("📝 Sample order structure:");
-            console.log({
-                orderNumber: orders[0].orderNumber,
-                date: orders[0].date,
-                businessType: orders[0].businessType,
-                customer: orders[0].customer?.name,
-                total: orders[0].total,
-                itemsCount: orders[0].items?.length
-            });
-        }
 
         res.status(200).json({
             success: true,
@@ -1732,119 +1543,68 @@ router.get("/all/get-invoices", async (req, res) => {
                 limit: parseInt(limit),
                 pages: Math.ceil(total / parseInt(limit))
             },
-            filters: {
-                orderType,
-                status,
-                startDate,
-                endDate
-            },
-            debug: {
-                requestTime: new Date().toISOString(),
-                queryUsed: query,
-                ordersReturned: orders.length
-            }
+            filters: { orderType, status, startDate, endDate }
         });
 
-        console.log("📤 Response sent successfully");
-        console.log("======================================================");
-
     } catch (error) {
-        console.error("❌ ERROR in get-invoices route:");
-        console.error("Error message:", error.message);
-        console.error("Error stack:", error.stack);
-        console.error("Full error:", error);
-
+        console.error("❌ ERROR in get-invoices route:", error);
         res.status(500).json({
             success: false,
             message: "Failed to fetch orders",
-            error: error.message,
-            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
-        });
-    }
-});
-
-// 🔍 GET ORDER BY ORDER NUMBER - KEEPING OLD NAME
-router.get("/get-invoice/:orderNumber", async (req, res) => {
-    try {
-        const { orderNumber } = req.params;
-
-        const order = await Order.findOne({ orderNumber });
-
-        if (!order) {
-            return res.status(404).json({
-                success: false,
-                message: "Order not found"
-            });
-        }
-
-        res.status(200).json({
-            success: true,
-            data: order
-        });
-    } catch (error) {
-        console.error("Error fetching order:", error);
-        res.status(500).json({
-            success: false,
-            message: "Failed to fetch order",
             error: error.message
         });
     }
 });
 
-// ✏️ UPDATE ORDER - KEEPING OLD NAME
+// 🔍 GET ORDER BY ORDER NUMBER
+router.get("/get-invoice/:orderNumber", async (req, res) => {
+    try {
+        const { orderNumber } = req.params;
+        const order = await Order.findOne({ orderNumber });
+
+        if (!order) {
+            return res.status(404).json({ success: false, message: "Order not found" });
+        }
+
+        res.status(200).json({ success: true, data: order });
+    } catch (error) {
+        console.error("Error fetching order:", error);
+        res.status(500).json({ success: false, message: "Failed to fetch order", error: error.message });
+    }
+});
+
+// ✏️ UPDATE ORDER
 router.put("/update-invoice/:orderNumber", async (req, res) => {
     const startTime = Date.now();
     const requestId = `UPDATE_ORD_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
     try {
         const { orderNumber } = req.params;
-        const { customer, payment, remarks, deliveryAddress } = req.body; // ✅ Changed shippingDetails to deliveryAddress
+        const { customer, payment, remarks, deliveryAddress } = req.body;
 
         console.log(`🔄 [${requestId}] Updating order: ${orderNumber}`);
 
-        // Find order
         const order = await Order.findOne({ orderNumber });
         if (!order) {
-            return res.status(404).json({
-                success: false,
-                message: "Order not found",
-                requestId
-            });
+            return res.status(404).json({ success: false, message: "Order not found", requestId });
         }
 
-        // Only offline orders can be updated via this route
         if (order.orderType !== 'offline') {
-            return res.status(400).json({
-                success: false,
-                message: "This route is only for updating offline orders",
-                requestId
-            });
+            return res.status(400).json({ success: false, message: "This route is only for updating offline orders", requestId });
         }
 
-        // Build update payload
         const updatePayload = {};
         const changes = [];
 
-        // ✅ Update delivery address (previously shippingDetails)
         if (deliveryAddress !== undefined) {
             if (deliveryAddress === null) {
                 updatePayload.deliveryAddress = null;
                 changes.push("Delivery address: Cleared (same as billing)");
             } else if (typeof deliveryAddress === 'object') {
-                // Validate delivery address
                 if (!deliveryAddress.fullName || !deliveryAddress.mobile) {
-                    console.log(`❌ [${requestId}] Delivery address validation failed:`, {
-                        hasFullName: !!deliveryAddress.fullName,
-                        hasMobile: !!deliveryAddress.mobile
-                    });
-                    return res.status(400).json({
-                        success: false,
-                        message: "Delivery name and mobile are required",
-                        requestId
-                    });
+                    return res.status(400).json({ success: false, message: "Delivery name and mobile are required", requestId });
                 }
 
-                // Update delivery address
                 updatePayload.deliveryAddress = {
                     addressId: deliveryAddress.addressId || "",
                     fullName: deliveryAddress.fullName,
@@ -1865,7 +1625,6 @@ router.put("/update-invoice/:orderNumber", async (req, res) => {
             }
         }
 
-        // Update payment
         if (payment && payment.method) {
             if (payment.method !== order.payment.method) {
                 updatePayload["payment.method"] = payment.method;
@@ -1873,7 +1632,6 @@ router.put("/update-invoice/:orderNumber", async (req, res) => {
             }
         }
 
-        // Update customer
         if (customer) {
             const updatedCustomer = { ...order.customer };
             let customerChanged = false;
@@ -1904,24 +1662,15 @@ router.put("/update-invoice/:orderNumber", async (req, res) => {
             }
         }
 
-        // Update remarks
         if (remarks !== undefined && remarks !== order.remarks) {
             updatePayload.remarks = remarks;
             changes.push(`Remarks updated`);
         }
 
-        // Check if any changes
         if (Object.keys(updatePayload).length === 0) {
-            return res.status(200).json({
-                success: true,
-                message: "No changes detected",
-                data: order,
-                requestId,
-                changes: []
-            });
+            return res.status(200).json({ success: true, message: "No changes detected", data: order, requestId, changes: [] });
         }
 
-        // Update order
         const updatedOrder = await Order.findOneAndUpdate(
             { orderNumber },
             updatePayload,
@@ -1929,12 +1678,6 @@ router.put("/update-invoice/:orderNumber", async (req, res) => {
         );
 
         const processingTime = Date.now() - startTime;
-
-        console.log(`✅ [${requestId}] Order updated successfully`, {
-            orderNumber,
-            changesApplied: changes.length,
-            processingTime: `${processingTime}ms`
-        });
 
         res.status(200).json({
             success: true,
@@ -1947,35 +1690,24 @@ router.put("/update-invoice/:orderNumber", async (req, res) => {
 
     } catch (error) {
         const processingTime = Date.now() - startTime;
-
         console.error(`💥 [${requestId}] Error updating order:`, error);
-        res.status(500).json({
-            success: false,
-            message: "Failed to update order",
-            error: error.message,
-            requestId,
-            processingTime: `${processingTime}ms`
-        });
+        res.status(500).json({ success: false, message: "Failed to update order", error: error.message, requestId, processingTime: `${processingTime}ms` });
     }
 });
 
-// 🗑️ DELETE ORDER - KEEPING OLD NAME
-router.delete("/delete-invoice/:orderNumber", async (req, res) => {
+// 🗑️ DELETE ORDER (now archives instead of hard delete + releases number)
+router.delete("/delete-invoice/:orderNumber", auth, async (req, res) => {
     try {
         const { orderNumber } = req.params;
+        const { reason } = req.body || {};
 
         console.log(`🗑️ Attempting to delete order: ${orderNumber}`);
 
-        // Find order
         const orderToDelete = await Order.findOne({ orderNumber });
         if (!orderToDelete) {
-            return res.status(404).json({
-                success: false,
-                message: "Order not found"
-            });
+            return res.status(404).json({ success: false, message: "Order not found" });
         }
 
-        // Only offline orders can be deleted via this route
         if (orderToDelete.orderType !== 'offline') {
             return res.status(400).json({
                 success: false,
@@ -1983,67 +1715,22 @@ router.delete("/delete-invoice/:orderNumber", async (req, res) => {
             });
         }
 
-        // Archive order first (you need to create DeletedOrder model)
-        /*
-        const deletedOrder = new DeletedOrder({
-            originalOrderNumber: orderNumber,
-            orderData: orderToDelete.toObject(),
-            deletedBy: req.user?.username || "system",
-            deletedAt: new Date()
-        });
-        await deletedOrder.save();
-        */
+        // Restore stock + ProductStockHistory
+        await restoreOrderStock(orderToDelete, reason || 'Deleted', 'delete-route');
 
-        // Restore inventory quantities
-        const stockRestorationDetails = [];
-        for (const item of orderToDelete.items) {
-            const inventoryItem = await Inventory.findOne({ productId: item.productId });
-            if (inventoryItem) {
-                const batch = inventoryItem.batches.find(b => b.batchNumber === item.batchNumber);
-                if (batch) {
-                    const beforeStock = batch.quantity;
-                    batch.quantity += item.quantity;
-                    const afterStock = batch.quantity;
+        // Archive + delete + release number
+        await archiveCancelledOrder(orderToDelete, req, reason || '', 'delete-route');
 
-                    stockRestorationDetails.push({
-                        productId: item.productId,
-                        productName: item.productName,
-                        batchNumber: item.batchNumber,
-                        quantityRestored: item.quantity,
-                        beforeDeletionStock: beforeStock,
-                        afterRestorationStock: afterStock
-                    });
-
-                    await inventoryItem.save();
-                }
-            }
-        }
-
-        // Delete order
-        await Order.findOneAndDelete({ orderNumber });
-
-        console.log(`✅ Order deleted successfully:`, {
-            orderNumber,
-            customer: orderToDelete.customer?.name || 'Unknown',
-            itemsRestored: stockRestorationDetails.length
-        });
+        console.log(`✅ Order deleted & archived: ${orderNumber}`);
 
         res.status(200).json({
             success: true,
-            message: "Order deleted successfully and inventory restored",
-            restorationDetails: {
-                itemsRestored: stockRestorationDetails.length,
-                details: stockRestorationDetails
-            }
+            message: "Order deleted, archived, and inventory restored"
         });
 
     } catch (error) {
         console.error('Error deleting order:', error);
-        res.status(500).json({
-            success: false,
-            message: "Failed to delete order",
-            error: error.message
-        });
+        res.status(500).json({ success: false, message: "Failed to delete order", error: error.message });
     }
 });
 
@@ -2051,25 +1738,20 @@ router.delete("/delete-invoice/:orderNumber", async (req, res) => {
 // SECTION 3: COMMON/UNIFIED ROUTES
 // ======================================================================
 
-// 📊 GET DASHBOARD STATS (BOTH ONLINE & OFFLINE)
+// 📊 GET DASHBOARD STATS
 router.get("/dashboard/stats", async (req, res) => {
     try {
         const { startDate, endDate } = req.query;
 
         const dateFilter = {};
-        if (startDate) {
-            dateFilter.$gte = new Date(startDate);
-        }
-        if (endDate) {
-            dateFilter.$lte = new Date(endDate);
-        }
+        if (startDate) dateFilter.$gte = new Date(startDate);
+        if (endDate) dateFilter.$lte = new Date(endDate);
 
         const matchStage = {};
         if (startDate || endDate) {
             matchStage.createdAt = dateFilter;
         }
 
-        // Get overall stats
         const overallStats = await Order.aggregate([
             { $match: matchStage },
             {
@@ -2077,12 +1759,8 @@ router.get("/dashboard/stats", async (req, res) => {
                     _id: null,
                     totalOrders: { $sum: 1 },
                     totalRevenue: { $sum: "$total" },
-                    onlineOrders: {
-                        $sum: { $cond: [{ $eq: ["$orderType", "online"] }, 1, 0] }
-                    },
-                    offlineOrders: {
-                        $sum: { $cond: [{ $eq: ["$orderType", "offline"] }, 1, 0] }
-                    },
+                    onlineOrders: { $sum: { $cond: [{ $eq: ["$orderType", "online"] }, 1, 0] } },
+                    offlineOrders: { $sum: { $cond: [{ $eq: ["$orderType", "offline"] }, 1, 0] } },
                     totalItems: {
                         $sum: {
                             $reduce: {
@@ -2096,7 +1774,6 @@ router.get("/dashboard/stats", async (req, res) => {
             }
         ]);
 
-        // Get status breakdown
         const statusBreakdown = await Order.aggregate([
             { $match: matchStage },
             {
@@ -2109,7 +1786,6 @@ router.get("/dashboard/stats", async (req, res) => {
             { $sort: { count: -1 } }
         ]);
 
-        // Get type breakdown
         const typeBreakdown = await Order.aggregate([
             { $match: matchStage },
             {
@@ -2121,16 +1797,11 @@ router.get("/dashboard/stats", async (req, res) => {
             }
         ]);
 
-        // Get today's stats
         const today = new Date();
         today.setHours(0, 0, 0, 0);
 
         const todayStats = await Order.aggregate([
-            {
-                $match: {
-                    createdAt: { $gte: today }
-                }
-            },
+            { $match: { createdAt: { $gte: today } } },
             {
                 $group: {
                     _id: null,
@@ -2140,7 +1811,6 @@ router.get("/dashboard/stats", async (req, res) => {
             }
         ]);
 
-        // Get top products
         const topProducts = await Order.aggregate([
             { $match: matchStage },
             { $unwind: "$items" },
@@ -2158,7 +1828,6 @@ router.get("/dashboard/stats", async (req, res) => {
             { $limit: 10 }
         ]);
 
-        // Get payment method breakdown
         const paymentBreakdown = await Order.aggregate([
             { $match: matchStage },
             {
@@ -2181,10 +1850,7 @@ router.get("/dashboard/stats", async (req, res) => {
                     offlineOrders: 0,
                     totalItems: 0
                 }),
-                todayStats: todayStats[0] || {
-                    todayOrders: 0,
-                    todayRevenue: 0
-                },
+                todayStats: todayStats[0] || { todayOrders: 0, todayRevenue: 0 },
                 statusBreakdown,
                 typeBreakdown,
                 topProducts,
@@ -2197,19 +1863,11 @@ router.get("/dashboard/stats", async (req, res) => {
 
     } catch (error) {
         console.error('Error fetching dashboard stats:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to fetch dashboard stats',
-            error: error.message
-        });
+        res.status(500).json({ success: false, message: 'Failed to fetch dashboard stats', error: error.message });
     }
 });
 
-
-
-
-
-// 🔄 UPDATE ORDER PRODUCTS (WITH PROPER INVENTORY MANAGEMENT)
+// 🔄 UPDATE ORDER PRODUCTS
 router.put("/update-order-products/:orderNumber", async (req, res) => {
     const requestId = `UPDATE_PROD_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const startTime = Date.now();
@@ -2221,31 +1879,17 @@ router.put("/update-order-products/:orderNumber", async (req, res) => {
         console.log(`🔄 [${requestId}] Updating order products: ${orderNumber}`);
 
         if (!updatedItems || !Array.isArray(updatedItems)) {
-            return res.status(400).json({
-                success: false,
-                message: "Updated items are required",
-                requestId
-            });
+            return res.status(400).json({ success: false, message: "Updated items are required", requestId });
         }
-
         if (!originalItems || !Array.isArray(originalItems)) {
-            return res.status(400).json({
-                success: false,
-                message: "Original items are required",
-                requestId
-            });
+            return res.status(400).json({ success: false, message: "Original items are required", requestId });
         }
 
         const order = await Order.findOne({ orderNumber });
         if (!order) {
-            return res.status(404).json({
-                success: false,
-                message: "Order not found",
-                requestId
-            });
+            return res.status(404).json({ success: false, message: "Order not found", requestId });
         }
 
-        // Build maps
         const originalMap = new Map();
         originalItems.forEach(item => {
             const key = `${item.productId}_${item.batchNumber}`;
@@ -2258,7 +1902,6 @@ router.put("/update-order-products/:orderNumber", async (req, res) => {
             updatedMap.set(key, { ...item, newQuantity: item.quantity });
         });
 
-        // Calculate changes
         const changes = {
             itemsToRestore: [],
             itemsToDeduct: [],
@@ -2268,11 +1911,7 @@ router.put("/update-order-products/:orderNumber", async (req, res) => {
         for (const [key, originalItem] of originalMap.entries()) {
             const updatedItem = updatedMap.get(key);
             if (!updatedItem) {
-                changes.itemsToRestore.push({
-                    ...originalItem,
-                    changeType: "removed",
-                    quantityToRestore: originalItem.quantity
-                });
+                changes.itemsToRestore.push({ ...originalItem, changeType: "removed", quantityToRestore: originalItem.quantity });
             } else if (updatedItem.quantity < originalItem.quantity) {
                 const quantityDecrease = originalItem.quantity - updatedItem.quantity;
                 changes.itemsToRestore.push({
@@ -2289,11 +1928,7 @@ router.put("/update-order-products/:orderNumber", async (req, res) => {
         for (const [key, updatedItem] of updatedMap.entries()) {
             const originalItem = originalMap.get(key);
             if (!originalItem) {
-                changes.itemsToDeduct.push({
-                    ...updatedItem,
-                    changeType: "added",
-                    quantityToDeduct: updatedItem.quantity
-                });
+                changes.itemsToDeduct.push({ ...updatedItem, changeType: "added", quantityToDeduct: updatedItem.quantity });
             } else if (updatedItem.quantity > originalItem.quantity) {
                 const quantityIncrease = updatedItem.quantity - originalItem.quantity;
                 changes.itemsToDeduct.push({
@@ -2305,7 +1940,6 @@ router.put("/update-order-products/:orderNumber", async (req, res) => {
             }
         }
 
-        // Validate availability for deductions
         const validationErrors = [];
         for (const item of changes.itemsToDeduct) {
             const inventoryItem = await Inventory.findOne({ productId: item.productId });
@@ -2329,21 +1963,13 @@ router.put("/update-order-products/:orderNumber", async (req, res) => {
         }
 
         if (validationErrors.length > 0) {
-            return res.status(400).json({
-                success: false,
-                message: "Inventory validation failed",
-                validationErrors,
-                requestId
-            });
+            return res.status(400).json({ success: false, message: "Inventory validation failed", validationErrors, requestId });
         }
 
-        const ProductStockHistory = require("../modals/ProductStockHistory");
-
-        // RESTORE items (add back to inventory)
+        // RESTORE items
         for (const item of changes.itemsToRestore) {
             const inventoryItem = await Inventory.findOne({ productId: item.productId });
             if (!inventoryItem) continue;
-
             const batch = inventoryItem.batches.find(b => b.batchNumber === item.batchNumber);
             if (!batch) continue;
 
@@ -2357,7 +1983,6 @@ router.put("/update-order-products/:orderNumber", async (req, res) => {
 
             const newQuantity = batch.currentQuantity;
 
-            // ✅ UPDATE PRODUCT STOCK HISTORY
             let productStockDoc = await ProductStockHistory.findOne({ productId: item.productId });
             if (!productStockDoc) {
                 productStockDoc = new ProductStockHistory({
@@ -2387,7 +2012,7 @@ router.put("/update-order-products/:orderNumber", async (req, res) => {
                 quantity: item.quantityToRestore,
                 previousStock: beforeQuantity,
                 newStock: newQuantity,
-                orderNumber: orderNumber,
+                orderNumber,
                 orderType: order.orderType,
                 reason: `Invoice ${orderNumber} edit - ${item.changeType}`,
                 notes: `Product: ${item.productName} | Restored: ${item.quantityToRestore}`,
@@ -2399,11 +2024,10 @@ router.put("/update-order-products/:orderNumber", async (req, res) => {
             await inventoryItem.save();
         }
 
-        // DEDUCT items (remove from inventory)
+        // DEDUCT items
         for (const item of changes.itemsToDeduct) {
             const inventoryItem = await Inventory.findOne({ productId: item.productId });
             if (!inventoryItem) continue;
-
             const batch = inventoryItem.batches.find(b => b.batchNumber === item.batchNumber);
             if (!batch) continue;
 
@@ -2417,7 +2041,6 @@ router.put("/update-order-products/:orderNumber", async (req, res) => {
 
             const newQuantity = batch.currentQuantity;
 
-            // ✅ UPDATE PRODUCT STOCK HISTORY
             let productStockDoc = await ProductStockHistory.findOne({ productId: item.productId });
             if (!productStockDoc) {
                 productStockDoc = new ProductStockHistory({
@@ -2447,7 +2070,7 @@ router.put("/update-order-products/:orderNumber", async (req, res) => {
                 quantity: item.quantityToDeduct,
                 previousStock: beforeQuantity,
                 newStock: newQuantity,
-                orderNumber: orderNumber,
+                orderNumber,
                 orderType: order.orderType,
                 reason: `Invoice ${orderNumber} edit - ${item.changeType}`,
                 notes: `Product: ${item.productName} | Deducted: ${item.quantityToDeduct}`,
@@ -2459,7 +2082,7 @@ router.put("/update-order-products/:orderNumber", async (req, res) => {
             await inventoryItem.save();
         }
 
-        // Update order items and totals
+        // Recalc totals
         const finalItems = updatedItems.map(item => {
             const price = item.price || 0;
             const quantity = item.quantity || 1;

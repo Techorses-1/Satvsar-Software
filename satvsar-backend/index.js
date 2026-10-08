@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const connectDB = require("./config/mongodb");
+const { connectSharedDB } = require("./config/sharedDb");
 const path = require("path");
 
 dotenv.config();
@@ -35,8 +36,14 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Connect MongoDB
+// Connect MongoDB (main E-com DB)
 connectDB();
+
+// Connect Shared DB (POS DB — for shared invoice number registry)
+connectSharedDB().catch((err) => {
+  console.error("❌ Failed to connect shared DB:", err.message);
+  process.exit(1);
+});
 
 // ====== IMPORTANT: Static files BEFORE routes ======
 app.use("/products-images", express.static(path.join(__dirname, "products-images")));

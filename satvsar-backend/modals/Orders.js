@@ -65,7 +65,6 @@ const OrderItemSchema = new mongoose.Schema({
     },
 
     // ========== DISCOUNTS & OFFERS (BOTH SYSTEMS) ==========
-    // Product-specific offer (E-commerce style)
     offerPercentage: {
         type: Number,
         default: 0,
@@ -82,7 +81,6 @@ const OrderItemSchema = new mongoose.Schema({
         default: ""
     },
 
-    // Item-level discount (Billing style)
     discount: {
         type: Number,
         default: 0,
@@ -159,7 +157,7 @@ const OrderItemSchema = new mongoose.Schema({
 
 const OrderSchema = new mongoose.Schema({
     // ========== ORDER IDENTIFICATION ==========
-    orderNumber: {          // Sequential: INV20250001, INV20250002, etc.
+    orderNumber: {          // Sequential: INV20260001, INV20260002, etc.
         type: String,
         required: true,
         unique: true,
@@ -175,24 +173,24 @@ const OrderSchema = new mongoose.Schema({
     },
 
     // ========== ORDER SOURCE & TYPE ==========
-    orderType: {            // Source of order
+    orderType: {
         type: String,
         enum: ['online', 'offline'],
         required: true,
         index: true
     },
-    businessType: {         // For billing/offline orders
+    businessType: {
         type: String,
         enum: ['b2b', 'b2c'],
         default: 'b2c'
     },
 
     // ========== USER/CUSTOMER INFORMATION ==========
-    userId: {               // For online users (optional for offline)
+    userId: {
         type: String,
         index: true
     },
-    customer: {             // For offline/store customers
+    customer: {
         customerId: String,
         customerNumber: String,
         name: String,
@@ -203,7 +201,6 @@ const OrderSchema = new mongoose.Schema({
     },
 
     // ========== SHIPPING/DELIVERY INFORMATION ==========
-    // For Online orders (E-commerce style)
     deliveryAddress: {
         addressId: String,
         fullName: String,
@@ -221,7 +218,6 @@ const OrderSchema = new mongoose.Schema({
         isDefault: Boolean
     },
 
-    // For Offline orders (Billing style)
     shippingDetails: {
         name: String,
         email: String,
@@ -252,30 +248,30 @@ const OrderSchema = new mongoose.Schema({
     },
 
     // ========== DISCOUNTS (MULTIPLE TYPES) ==========
-    discount: {             // Item-level discounts total
+    discount: {
         type: Number,
         default: 0
     },
-    promoDiscount: {        // Promo code discount (Billing style)
+    promoDiscount: {
         type: Number,
         default: 0
     },
-    appliedPromoCode: {     // Promo code details
+    appliedPromoCode: {
         promoId: String,
         code: String,
         discount: Number,
         description: String,
         appliedAt: Date
     },
-    loyaltyDiscount: {      // Loyalty points discount
+    loyaltyDiscount: {
         type: Number,
         default: 0
     },
-    loyaltyCoinsUsed: {     // Loyalty coins used
+    loyaltyCoinsUsed: {
         type: Number,
         default: 0
     },
-    totalSavings: {         // Total savings from all sources (E-commerce)
+    totalSavings: {
         type: Number,
         default: 0
     },
@@ -293,18 +289,18 @@ const OrderSchema = new mongoose.Schema({
         type: Number,
         default: 0
     },
-    taxPercentage: {        // For simple tax calculation (E-commerce)
+    taxPercentage: {
         type: Number,
         default: 18
     },
-    hasMixedTaxRates: {     // For orders with multiple tax slabs
+    hasMixedTaxRates: {
         type: Boolean,
         default: false
     },
     taxPercentages: [Number],
 
     // ========== SHIPPING & OTHER CHARGES ==========
-    shipping: {             // Shipping charges (Online)
+    shipping: {
         type: Number,
         default: 0
     },
@@ -422,15 +418,10 @@ OrderSchema.virtual('customerMobile').get(function () {
 OrderSchema.pre("save", function (next) {
     this.updatedAt = new Date();
 
-    // Auto-calculate some fields if not set
-    if (!this.orderNumber && this.orderType === 'online') {
-        // Will be set by route handler with GlobalCounter
-    }
-
     // Set estimated delivery for online orders
     if (this.orderType === 'online' && !this.timeline.estimatedDelivery) {
         const estDate = new Date();
-        estDate.setDate(estDate.getDate() + 5); // 5 days from order
+        estDate.setDate(estDate.getDate() + 5);
         this.timeline.estimatedDelivery = estDate;
     }
 
@@ -458,24 +449,6 @@ OrderSchema.pre("save", function (next) {
     }
 });
 
-// ========== STATIC METHODS ==========
-OrderSchema.statics.generateOrderNumber = async function () {
-    const GlobalCounter = mongoose.model('GlobalCounter');
-    const counterId = "orders";
-
-    const counter = await GlobalCounter.findOneAndUpdate(
-        { id: counterId },
-        { $inc: { count: 1 } },
-        {
-            new: true,
-            upsert: true,
-            setDefaultsOnInsert: true
-        }
-    );
-
-    return `INV${new Date().getFullYear()}${String(counter.count).padStart(5, "0")}`;
-};
-
 // ========== INSTANCE METHODS ==========
 OrderSchema.methods.calculateTotals = function () {
     let subtotal = 0;
@@ -486,7 +459,6 @@ OrderSchema.methods.calculateTotals = function () {
     let cgst = 0;
     let sgst = 0;
 
-    // Recalculate all item totals
     this.items.forEach(item => {
         const itemTotalBeforeDiscount = item.price * item.quantity;
         const itemDiscount = itemTotalBeforeDiscount * (item.discount / 100);
@@ -496,7 +468,6 @@ OrderSchema.methods.calculateTotals = function () {
         totalDiscount += itemDiscount;
         totalSavings += item.savedAmount || 0;
 
-        // GST Calculation
         const itemBaseValue = itemTotalAfterDiscount / (1 + item.taxSlab / 100);
         const itemTax = itemTotalAfterDiscount - itemBaseValue;
 
@@ -505,7 +476,6 @@ OrderSchema.methods.calculateTotals = function () {
         cgst += itemTax / 2;
         sgst += itemTax / 2;
 
-        // Update item calculated fields
         item.baseValue = parseFloat(itemBaseValue.toFixed(2));
         item.discountAmount = parseFloat(itemDiscount.toFixed(2));
         item.taxAmount = parseFloat(itemTax.toFixed(2));
@@ -514,23 +484,17 @@ OrderSchema.methods.calculateTotals = function () {
         item.totalAmount = parseFloat(itemTotalAfterDiscount.toFixed(2));
     });
 
-    // Apply promo discount
     let finalTotal = subtotal - totalDiscount;
     if (this.promoDiscount && this.promoDiscount > 0) {
         finalTotal -= this.promoDiscount;
     }
-
-    // Apply loyalty discount
     if (this.loyaltyDiscount && this.loyaltyDiscount > 0) {
         finalTotal -= this.loyaltyDiscount;
     }
-
-    // Add shipping for online orders
     if (this.orderType === 'online') {
         finalTotal += this.shipping || 0;
     }
 
-    // Update order totals
     this.subtotal = parseFloat(subtotal.toFixed(2));
     this.discount = parseFloat(totalDiscount.toFixed(2));
     this.totalSavings = parseFloat(totalSavings.toFixed(2));
@@ -540,7 +504,6 @@ OrderSchema.methods.calculateTotals = function () {
     this.sgst = parseFloat(sgst.toFixed(2));
     this.total = parseFloat(finalTotal.toFixed(2));
 
-    // Calculate loyalty coins (1 coin per 100 rupees base value)
     this.loyaltyCoinsEarned = Math.floor(this.baseValue / 100);
 
     return this;
