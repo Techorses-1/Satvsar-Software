@@ -93,7 +93,7 @@ app.use("/distributor", distributorRoutes);
 
 // Test route
 app.get("/", (req, res) => {
-  res.send("New billing.satvsar.com");
+  res.send("New satvsar Backend ");
 });
 
 // Error handling middleware
