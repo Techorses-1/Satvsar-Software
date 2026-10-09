@@ -25,7 +25,7 @@ const getActiveInvoiceNumberModel = () => {
         conn.models.ActiveInvoiceNumber ||
         conn.model(
             "ActiveInvoiceNumber",
-            require("../models/ActiveInvoiceNumber").schema
+            require("../modals/ActiveInvoiceNumber").schema
         )
     );
 };
